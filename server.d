@@ -1,3 +1,8 @@
+#!/usr/bin/env rund
+//!importPath ..\mored
+
+pragma(lib, "gdi32");
+
 static import core.stdc.stdlib;
 import core.time : MonoTime, dur, Duration;
 import core.thread : Thread;
@@ -26,8 +31,9 @@ import std.format : format;
 import std.array : appender;
 import std.typecons : Flag, Yes, No;
 
-import more.net;
+import more.alloc : GCDoubler;
 import more.builder;
+import more.net.sock;
 
 import util;
 import sharedwindows;
@@ -48,7 +54,7 @@ __gshared bool verbose = false;
 __gshared PixelSource pixelSource;
 __gshared HWND windowHandle = null;
 __gshared WindowScraper windowScraper;
-__gshared socket_t sock;
+__gshared SocketHandle sock;
 __gshared uint sockMaxMessageSize;
 __gshared ubyte[] sockSendBuffer;
 __gshared Builder!(Client, GCDoubler!10) clients;
@@ -168,7 +174,7 @@ int main(string[] args)
     // create the socket
     {
         // TODO: add option to limit the network interfaces to listen on
-        auto listenAddr = sockaddr_in(AddressFamily.inet, htons(listenPort), in_addr.any);
+        auto listenAddr = sockaddr_in(AddressFamily.inet, Port(htons(listenPort)), in_addr.any);
 
         sock = createsocket(AddressFamily.inet, SocketType.dgram, Protocol.udp);
         if(sock.isInvalid)
@@ -176,7 +182,7 @@ int main(string[] args)
             writefln("Error: createsocket failed (e=%s)", GetLastError());
             return 1;
         }
-        if(failed(bind(sock, &listenAddr)))
+        if(bind(sock, &listenAddr).failed)
         {
             writefln("Error: bind failed (e=%s)", GetLastError());
             return 1;
@@ -263,25 +269,25 @@ void waitForAClient()
 
         sockaddr_in from;
         writeln("waiting for clients...");
-        auto length = recvfrom(sock, recvBuffer, 0, &from);
-        if(length < 0)
+        auto recvResult = recvfrom(sock, recvBuffer, 0, &from);
+        if(recvResult.failed)
         {
             writefln("Error: recvfrom failed (e=%s)", GetLastError());
             assert(0, "recvfrom failed, check log");
         }
-        if(length == 0)
+        if(recvResult.length == 0)
         {
             writefln("Warning: got a 0-length datagram from %s", from);
         }
         else
         {
-            writefln("Got a %s-byte packet!", length);
+            writefln("Got a %s-byte packet!", recvResult.length);
             auto command = recvBuffer[0];
             switch(command)
             {
                 case ClientToServerMessage.connect:
                     auto newClient = Client(from);
-                    if(!newClient.handleConnect(recvBuffer[1..length]))
+                    if(!newClient.handleConnect(recvBuffer[1..recvResult.length]))
                     {
                         // error already logged
                         break;
@@ -319,8 +325,8 @@ void handleIncoming(Duration minTime/*, Duration maxTime*/)
             // TODO: handle maxTime
 
             sockaddr_in from;
-            auto length = recvfrom(sock, recvBuffer, 0, &from);
-            if(length < 0)
+            auto recvResult = recvfrom(sock, recvBuffer, 0, &from);
+            if(recvResult.failed)
             {
                 auto error = GetLastError();
                 if(error == WSAEWOULDBLOCK)
@@ -330,7 +336,7 @@ void handleIncoming(Duration minTime/*, Duration maxTime*/)
                 writefln("Error: recvfrom failed (e=%s)", GetLastError());
                 assert(0, "recvfrom failed, check log");
             }
-            handleDatagram(&from, recvBuffer[0..length]);
+            handleDatagram(&from, recvBuffer[0..recvResult.length]);
         }
 
         if(minTime <= Duration.zero)
@@ -356,14 +362,14 @@ void handleIncoming(Duration minTime/*, Duration maxTime*/)
     }
 }
 
-void waitForSocketWriteable(socket_t sock)
+void waitForSocketWriteable(SocketHandle sock)
 {
 }
-void waitForDatagram(socket_t sock)
+void waitForDatagram(SocketHandle sock)
 {
     fd_set_custom!1 readSet;
     readSet.fd_count = 1;
-    readSet.fd_array[0] = sock;
+    readSet.fd_array[0] = sock.val;
     auto result = select(0, cast(fd_set*)&readSet, null, null, null);
     if(result == SOCKET_ERROR)
     {
@@ -372,7 +378,8 @@ void waitForDatagram(socket_t sock)
     }
     assert(result == 1, "waitForDatagram: select returned unexpected value");
 }
-Flag!"haveDatagram" waitForDatagram(socket_t sock, Duration timeout)
+
+Flag!"haveDatagram" waitForDatagram(SocketHandle sock, Duration timeout)
     in { assert(timeout > Duration.zero, "cannot pass a non-positive timeout to waitForDatagram"); } body
 {
     auto selectTimeout = timeout.toTimeval();
@@ -380,7 +387,7 @@ Flag!"haveDatagram" waitForDatagram(socket_t sock, Duration timeout)
 
     fd_set_custom!1 readSet;
     readSet.fd_count = 1;
-    readSet.fd_array[0] = sock;
+    readSet.fd_array[0] = sock.val;
     auto result = select(0, cast(fd_set*)&readSet, null, null, &selectTimeout);
     if(result == SOCKET_ERROR)
     {
@@ -490,14 +497,12 @@ struct Client
         // HACK: for now just keep trying to resend until it works
         for(uint attemptIndex = 0;;attemptIndex++)
         {
-            auto result = sendto(sock, message, 0, &addr);
-            if(result == message.length)
-            {
+            const sendResult = sendto(sock, message, 0, &addr);
+            if(sendResult.val == message.length)
                 return;
-            }
 
-            auto error = GetLastError();
-            if(result == SOCKET_ERROR && error == WSAEWOULDBLOCK)
+            const error = GetLastError();
+            if(sendResult.val == SOCKET_ERROR && error == WSAEWOULDBLOCK)
             {
                 if(attemptIndex > 0)
                 writefln("WARNING: sendto failed (attempt %s) with WSAEWOULDBLOCK, temporary hack, just sleep for a bit",
@@ -507,8 +512,8 @@ struct Client
             }
             else
             {
-                writefln("Warning: sendto(len=%s, to=%s) failed (return=%s, e=%s)",
-                    message.length, addr, result, GetLastError());
+                writefln("WARNING: sendto failed (len=%s, to=%s) (return=%s, e=%s)",
+                    message.length, addr, sendResult, GetLastError());
                 throw new Exception("sendto failed (check log)");
             }
             if(attemptIndex >= 10)

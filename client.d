@@ -1,3 +1,8 @@
+#!/usr/bin/env rund
+//!importPath ..\mored
+
+pragma(lib, "gdi32");
+
 static import core.stdc.stdlib;
 import core.time : TickDuration, Duration, MonoTime;
 import core.runtime : Runtime;
@@ -42,7 +47,7 @@ alias WSAEVENT = HANDLE;
 enum WSA_INVALID_EVENT = null;
 extern(Windows) WSAEVENT WSACreateEvent() nothrow @nogc @safe;
 extern(Windows) int WSARecvFrom(
-  socket_t          s,
+  SocketHandle      s,
   WSABUF*           lpBuffers,
   DWORD             dwBufferCount,
   DWORD*            lpNumberOfBytesRecvd,
@@ -53,7 +58,7 @@ extern(Windows) int WSARecvFrom(
   void*             lpCompletionRoutine
 )  nothrow @nogc @safe;
 extern(Windows) BOOL WSAGetOverlappedResult(
-  socket_t          s,
+  SocketHandle      s,
   WSAOVERLAPPED*    lpOverlapped,
   DWORD*            lpcbTransfer,
   BOOL              fWait,
@@ -64,7 +69,7 @@ import std.stdio : File;
 import std.format : format, formattedWrite;
 import std.array  : Appender;
 import std.typecons : Flag, Yes, No;
-import std.datetime : StopWatch, AutoStart;
+import std.datetime.stopwatch : StopWatch, AutoStart;
 import std.algorithm : sort;
 import std.internal.cstring : tempCString;
 
@@ -75,9 +80,9 @@ import sharedwindows;
 import protocol;
 import gdibitmap;
 
-//enum SERVER_IP = 0x7F000001;
+enum SERVER_IP = 0x7F000001;
 //enum SERVER_IP = 0xC0A80002; // 192.168.0.2
-enum SERVER_IP = 0x18758109; // 24.117.129.9
+//enum SERVER_IP = 0x18758109; // 24.117.129.9
 
 enum SERVER_PORT = 8080;
 
@@ -159,7 +164,7 @@ struct Datagram
 
 struct EventSocket
 {
-    __gshared static socket_t sock;
+    __gshared static SocketHandle sock;
     __gshared static HANDLE eventHandle;
     __gshared static sockaddr_in from;
     __gshared static INT fromlen;
@@ -221,7 +226,7 @@ struct EventSocket
 void sendToServer(ubyte[] message)
 {
     auto result = sendto(EventSocket.sock, message, 0, &serverAddr);
-    if(result != message.length)
+    if(result.val != message.length)
     {
         fatalErrorf("Warning: sendto(len=%s, to=%s) failed (return=%s, e=%s)",
             message.length, serverAddr, result, GetLastError());
@@ -259,7 +264,7 @@ extern (Windows) int WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPS
         //
         // TEMPORARILY PUTTING THIS HERE
         //
-        serverAddr = sockaddr_in(AddressFamily.inet, htons(SERVER_PORT), in_addr(htonl(SERVER_IP)));
+        serverAddr = sockaddr_in(AddressFamily.inet, Port(htons(SERVER_PORT)), in_addr(htonl(SERVER_IP)));
         EventSocket.sock = createsocket(serverAddr.sin_family, SocketType.dgram, Protocol.udp);
         if(EventSocket.sock.isInvalid)
         {
@@ -268,8 +273,8 @@ extern (Windows) int WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPS
             return 1; // fail
         }
         {
-            sockaddr_in localAddr = sockaddr_in(AddressFamily.inet, 0, in_addr.any);
-            if(failed(bind(EventSocket.sock, &localAddr)))
+            sockaddr_in localAddr = sockaddr_in(AddressFamily.inet, Port(0), in_addr.any);
+            if(bind(EventSocket.sock, &localAddr).failed)
             {
                 Logger.logf("Error: bind failed (e=%s)", GetLastError());
                 return 1;
@@ -291,17 +296,17 @@ extern (Windows) int WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPS
                 sockaddr_in from;
                 ubyte[CONNECT_ACK_MESSAGE_LENGTH] connectAck;
                 Logger.logf("waiting for connect-ack");
-                auto length = recvfrom(EventSocket.sock, connectAck, 0, &from);
+                auto recvResult = recvfrom(EventSocket.sock, connectAck, 0, &from);
                 if(!from.equals(serverAddr))
                 {
                     Logger.logf("Warning: got a packet from %s which is not the same as the server %s",
                         from, serverAddr);
                     continue;
                 }
-                if(length != CONNECT_ACK_MESSAGE_LENGTH || connectAck[0] != ServerToClientMessage.connectAck)
+                if(recvResult.val != CONNECT_ACK_MESSAGE_LENGTH || connectAck[0] != ServerToClientMessage.connectAck)
                 {
                     Logger.logf("Warning: got an invalid connectAck command (length=%s, command=%s) from the server",
-                        length, connectAck[0]);
+                        recvResult.val, connectAck[0]);
                     if(attempt > 10)
                     {
                         Logger.logf("giving up after %s attempts", attempt + 1);
